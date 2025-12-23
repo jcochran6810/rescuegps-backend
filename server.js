@@ -1,312 +1,515 @@
 /**
- * server.js - STABLE VERSION
- * RescueGPS Backend - Works anywhere in USA
- * Fixed paths for Railway folder structure
+ * server.js
+ * RescueGPS Drift Engine Backend Server v2.3.0
+ * Express API for drift physics simulations and NOAA data
+ * 
+ * DEPLOY TO: Railway (GitHub rescuegps-backend repo root)
  */
 
 const express = require('express');
 const cors = require('cors');
 
+// Try to load NOAAService from multiple possible paths
+let NOAAService;
+try {
+  NOAAService = require('./drift-engine/services/NOAAService');
+  console.log('[Server] NOAAService loaded from drift-engine/services/');
+} catch (e1) {
+  try {
+    NOAAService = require('./NOAAService');
+    console.log('[Server] NOAAService loaded from root');
+  } catch (e2) {
+    try {
+      NOAAService = require('./services/NOAAService');
+      console.log('[Server] NOAAService loaded from services/');
+    } catch (e3) {
+      console.error('[Server] WARNING: Could not load NOAAService from any path');
+      NOAAService = null;
+    }
+  }
+}
+
+// Try to load SimulationController
+let SimulationController;
+try {
+  SimulationController = require('./drift-engine/api/SimulationController');
+  console.log('[Server] SimulationController loaded');
+} catch (e) {
+  console.log('[Server] SimulationController not available');
+  SimulationController = null;
+}
+
 const app = express();
-const PORT = process.env.PORT || 3001;
-
-// Lazy load services with correct paths
-let noaaService = null;
-let shorelineService = null;
-
-const getNoaaService = () => {
-  if (!noaaService) {
-    try {
-      // Try services folder first (your current structure)
-      const NOAAService = require('./drift-engine/services/NOAAService');
-      noaaService = new NOAAService();
-    } catch (e) {
-      // Fallback to root
-      try {
-        const NOAAService = require('./NOAAService');
-        noaaService = new NOAAService();
-      } catch (e2) {
-        console.error('NOAAService not found in either location');
-        return null;
-      }
-    }
-  }
-  return noaaService;
-};
-
-const getShorelineService = () => {
-  if (!shorelineService) {
-    try {
-      const ShorelineService = require('./drift-engine/services/ShorelineService');
-      shorelineService = new ShorelineService();
-    } catch (e) {
-      try {
-        const ShorelineService = require('./ShorelineService');
-        shorelineService = new ShorelineService();
-      } catch (e2) {
-        console.error('ShorelineService not found');
-        return null;
-      }
-    }
-  }
-  return shorelineService;
-};
+const PORT = process.env.PORT || 8080;
 
 // Middleware
-app.use(cors());
-app.use(express.json({ limit: '10mb' }));
+app.use(cors({
+  origin: '*',
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization']
+}));
+app.use(express.json({ limit: '50mb' }));
+
+// Initialize services
+const noaaService = NOAAService ? new NOAAService() : null;
+const simulationController = SimulationController ? new SimulationController() : null;
 
 // ============================================
-// HEALTH CHECK
+// HEALTH CHECK ENDPOINT
 // ============================================
 app.get('/health', (req, res) => {
   res.json({
     status: 'healthy',
-    service: 'RescueGPS Backend',
-    version: '2.2.1',
-    coverage: 'USA Nationwide',
+    service: 'RescueGPS Drift Engine',
+    version: '2.3.0',
     timestamp: new Date().toISOString(),
-    uptime: Math.floor(process.uptime())
+    uptime: process.uptime(),
+    noaaAvailable: !!noaaService,
+    simulationAvailable: !!simulationController
   });
 });
 
 // ============================================
-// NOAA ENVIRONMENTAL DATA
+// NOAA ENVIRONMENTAL DATA ENDPOINTS
 // ============================================
 
+/**
+ * GET /api/noaa/environmental
+ * Get comprehensive environmental data for a location
+ * This is the MAIN endpoint the frontend calls
+ */
 app.get('/api/noaa/environmental', async (req, res) => {
+  try {
+    const { lat, lng, refresh } = req.query;
+    
+    if (!lat || !lng) {
+      return res.status(400).json({ 
+        error: 'Missing required parameters: lat, lng' 
+      });
+    }
+    
+    if (!noaaService) {
+      return res.status(503).json({ 
+        error: 'NOAA service not available',
+        details: 'NOAAService failed to load. Check server logs.'
+      });
+    }
+    
+    console.log(`[NOAA] Fetching environmental data for ${lat}, ${lng}`);
+    
+    const data = await noaaService.getEnvironmentalData(
+      parseFloat(lat), 
+      parseFloat(lng)
+    );
+    
+    if (!data) {
+      return res.status(500).json({ 
+        error: 'Failed to fetch NOAA data',
+        isSimulated: true
+      });
+    }
+    
+    res.json(data);
+    
+  } catch (error) {
+    console.error('[NOAA] Error fetching environmental data:', error);
+    res.status(500).json({ 
+      error: error.message,
+      isSimulated: true
+    });
+  }
+});
+
+/**
+ * GET /api/noaa/stations/nearest
+ * Get nearest NOAA stations to coordinates
+ */
+app.get('/api/noaa/stations/nearest', async (req, res) => {
   try {
     const { lat, lng } = req.query;
     
     if (!lat || !lng) {
-      return res.status(400).json({ error: 'Missing lat, lng' });
+      return res.status(400).json({ error: 'Missing lat/lng parameters' });
     }
-
-    const latitude = parseFloat(lat);
-    const longitude = parseFloat(lng);
-
-    if (isNaN(latitude) || isNaN(longitude)) {
-      return res.status(400).json({ error: 'Invalid coordinates' });
-    }
-
-    const svc = getNoaaService();
-    if (!svc) {
-      return res.status(500).json({ error: 'NOAA service not available' });
-    }
-
-    const data = await svc.getEnvironmentalData(latitude, longitude);
-    res.json(data);
-
-  } catch (error) {
-    console.error('Env data error:', error.message);
-    res.status(500).json({ error: error.message });
-  }
-});
-
-app.get('/api/noaa/stations/nearest', (req, res) => {
-  try {
-    const { lat, lng } = req.query;
-    if (!lat || !lng) return res.status(400).json({ error: 'Missing lat, lng' });
     
-    const svc = getNoaaService();
-    if (!svc) return res.status(500).json({ error: 'Service not available' });
+    if (!noaaService) {
+      return res.status(503).json({ error: 'NOAA service not available' });
+    }
     
-    const stations = svc.getNearestStations(parseFloat(lat), parseFloat(lng));
+    const stations = noaaService.getNearestStations(
+      parseFloat(lat), 
+      parseFloat(lng)
+    );
+    
     res.json(stations);
+    
   } catch (error) {
+    console.error('[NOAA] Error getting nearest stations:', error);
     res.status(500).json({ error: error.message });
   }
 });
 
+/**
+ * GET /api/noaa/tides/:stationId
+ * Get tide predictions for a specific station
+ */
 app.get('/api/noaa/tides/:stationId', async (req, res) => {
   try {
-    const svc = getNoaaService();
-    if (!svc) return res.status(500).json({ error: 'Service not available' });
-    const data = await svc.getTidePredictions(req.params.stationId);
+    if (!noaaService) {
+      return res.status(503).json({ error: 'NOAA service not available' });
+    }
+    
+    const data = await noaaService.getTideData(req.params.stationId);
+    
+    if (!data) {
+      return res.status(404).json({ error: 'No tide data available for this station' });
+    }
+    
     res.json(data);
+    
   } catch (error) {
+    console.error('[NOAA] Error fetching tide data:', error);
     res.status(500).json({ error: error.message });
   }
 });
 
+/**
+ * GET /api/noaa/waterlevel/:stationId
+ * Get water level observations for a specific station
+ */
 app.get('/api/noaa/waterlevel/:stationId', async (req, res) => {
   try {
-    const svc = getNoaaService();
-    if (!svc) return res.status(500).json({ error: 'Service not available' });
-    const data = await svc.getWaterLevel(req.params.stationId);
+    if (!noaaService) {
+      return res.status(503).json({ error: 'NOAA service not available' });
+    }
+    
+    const data = await noaaService.getWaterLevel(req.params.stationId);
+    
+    if (!data) {
+      return res.status(404).json({ error: 'No water level data available' });
+    }
+    
     res.json(data);
+    
   } catch (error) {
+    console.error('[NOAA] Error fetching water level:', error);
     res.status(500).json({ error: error.message });
   }
 });
 
+/**
+ * GET /api/noaa/currents/:stationId
+ * Get current predictions for a specific station
+ */
 app.get('/api/noaa/currents/:stationId', async (req, res) => {
   try {
-    const svc = getNoaaService();
-    if (!svc) return res.status(500).json({ error: 'Service not available' });
-    const data = await svc.getCurrentPredictions(req.params.stationId);
+    if (!noaaService) {
+      return res.status(503).json({ error: 'NOAA service not available' });
+    }
+    
+    const data = await noaaService.getCurrentData(req.params.stationId);
+    
+    if (!data) {
+      return res.status(404).json({ error: 'No current data available' });
+    }
+    
     res.json(data);
+    
   } catch (error) {
+    console.error('[NOAA] Error fetching current data:', error);
     res.status(500).json({ error: error.message });
   }
 });
 
+/**
+ * GET /api/noaa/buoy/:buoyId
+ * Get buoy data from NDBC
+ */
 app.get('/api/noaa/buoy/:buoyId', async (req, res) => {
   try {
-    const svc = getNoaaService();
-    if (!svc) return res.status(500).json({ error: 'Service not available' });
-    const data = await svc.getBuoyData(req.params.buoyId);
+    if (!noaaService) {
+      return res.status(503).json({ error: 'NOAA service not available' });
+    }
+    
+    const data = await noaaService.getBuoyData(req.params.buoyId);
+    
+    if (!data) {
+      return res.status(404).json({ error: 'No buoy data available' });
+    }
+    
     res.json(data);
+    
   } catch (error) {
+    console.error('[NOAA] Error fetching buoy data:', error);
     res.status(500).json({ error: error.message });
   }
 });
 
+/**
+ * GET /api/noaa/weather
+ * Get weather forecast from NWS
+ */
 app.get('/api/noaa/weather', async (req, res) => {
   try {
     const { lat, lng } = req.query;
-    if (!lat || !lng) return res.status(400).json({ error: 'Missing lat, lng' });
-    const svc = getNoaaService();
-    if (!svc) return res.status(500).json({ error: 'Service not available' });
-    const data = await svc.getWeather(parseFloat(lat), parseFloat(lng));
+    
+    if (!lat || !lng) {
+      return res.status(400).json({ error: 'Missing lat/lng parameters' });
+    }
+    
+    if (!noaaService) {
+      return res.status(503).json({ error: 'NOAA service not available' });
+    }
+    
+    const data = await noaaService.getWeather(
+      parseFloat(lat), 
+      parseFloat(lng)
+    );
+    
+    if (!data) {
+      return res.status(404).json({ error: 'No weather data available' });
+    }
+    
     res.json(data);
+    
   } catch (error) {
+    console.error('[NOAA] Error fetching weather:', error);
     res.status(500).json({ error: error.message });
   }
 });
 
-// ============================================
-// SHORELINE DATA
-// ============================================
-
-app.get('/api/shoreline', (req, res) => {
+/**
+ * POST /api/noaa/refresh/:dataType/:stationId
+ * Force refresh data from a specific station
+ */
+app.post('/api/noaa/refresh/:dataType/:stationId', async (req, res) => {
   try {
-    const { lat, lng, radius } = req.query;
-    if (!lat || !lng) return res.status(400).json({ error: 'Missing lat, lng' });
+    if (!noaaService) {
+      return res.status(503).json({ error: 'NOAA service not available' });
+    }
     
-    const svc = getShorelineService();
-    if (!svc) return res.status(500).json({ error: 'Service not available' });
+    const { dataType, stationId } = req.params;
+    let data;
     
-    const data = svc.getShorelineData(parseFloat(lat), parseFloat(lng), parseFloat(radius) || 50);
+    switch (dataType) {
+      case 'tides':
+        data = await noaaService.getTideData(stationId);
+        break;
+      case 'currents':
+        data = await noaaService.getCurrentData(stationId);
+        break;
+      case 'buoy':
+        data = await noaaService.getBuoyData(stationId);
+        break;
+      case 'waterlevel':
+        data = await noaaService.getWaterLevel(stationId);
+        break;
+      default:
+        return res.status(400).json({ error: 'Invalid data type' });
+    }
+    
+    if (!data) {
+      return res.status(404).json({ error: 'No data available' });
+    }
+    
     res.json(data);
+    
   } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-app.get('/api/shoreline/check-point', (req, res) => {
-  try {
-    const { lat, lng } = req.query;
-    if (!lat || !lng) return res.status(400).json({ error: 'Missing lat, lng' });
-    
-    const svc = getShorelineService();
-    if (!svc) return res.status(500).json({ error: 'Service not available' });
-    
-    const data = svc.getShorelineData(parseFloat(lat), parseFloat(lng), 20);
-    const isLand = svc.isPointOnLand(parseFloat(lat), parseFloat(lng), data);
-    
-    res.json({ lat: parseFloat(lat), lng: parseFloat(lng), isLand, isWater: !isLand });
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-app.post('/api/shoreline/clip', (req, res) => {
-  try {
-    const { polygon, lat, lng } = req.body;
-    if (!polygon || !lat || !lng) return res.status(400).json({ error: 'Missing data' });
-    
-    const svc = getShorelineService();
-    if (!svc) return res.status(500).json({ error: 'Service not available' });
-    
-    const data = svc.getShorelineData(lat, lng, 50);
-    const clipped = svc.clipPolygonToWater(polygon, data);
-    
-    res.json({ original: polygon.length, clipped: clipped.length, polygon: clipped });
-  } catch (error) {
+    console.error('[NOAA] Error refreshing data:', error);
     res.status(500).json({ error: error.message });
   }
 });
 
 // ============================================
-// CHART INFO
+// SIMULATION ENDPOINTS
 // ============================================
 
-app.get('/api/charts/info', (req, res) => {
+/**
+ * POST /api/simulations
+ * Start a new drift simulation
+ */
+app.post('/api/simulations', async (req, res) => {
+  try {
+    if (!simulationController) {
+      return res.status(503).json({ error: 'Simulation service not available' });
+    }
+    const result = await simulationController.startSimulation(req.body);
+    res.json(result);
+  } catch (error) {
+    res.status(500).json({ 
+      error: error.message,
+      details: 'Failed to start simulation'
+    });
+  }
+});
+
+/**
+ * GET /api/simulations
+ * List all simulations
+ */
+app.get('/api/simulations', (req, res) => {
+  try {
+    if (!simulationController) {
+      return res.status(503).json({ error: 'Simulation service not available' });
+    }
+    const simulations = simulationController.listSimulations();
+    res.json(simulations);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+/**
+ * GET /api/simulations/:id/status
+ * Get simulation status
+ */
+app.get('/api/simulations/:id/status', (req, res) => {
+  try {
+    if (!simulationController) {
+      return res.status(503).json({ error: 'Simulation service not available' });
+    }
+    const status = simulationController.getSimulationStatus(req.params.id);
+    res.json(status);
+  } catch (error) {
+    res.status(404).json({ error: error.message });
+  }
+});
+
+/**
+ * GET /api/simulations/:id/results
+ * Get simulation results
+ */
+app.get('/api/simulations/:id/results', (req, res) => {
+  try {
+    if (!simulationController) {
+      return res.status(503).json({ error: 'Simulation service not available' });
+    }
+    const results = simulationController.getSimulationResults(req.params.id);
+    res.json(results);
+  } catch (error) {
+    res.status(404).json({ error: error.message });
+  }
+});
+
+/**
+ * DELETE /api/simulations/:id
+ * Cancel/delete a simulation
+ */
+app.delete('/api/simulations/:id', (req, res) => {
+  try {
+    if (!simulationController) {
+      return res.status(503).json({ error: 'Simulation service not available' });
+    }
+    simulationController.cancelSimulation(req.params.id);
+    res.json({ success: true, message: 'Simulation cancelled' });
+  } catch (error) {
+    res.status(404).json({ error: error.message });
+  }
+});
+
+// ============================================
+// OBJECT TYPES ENDPOINT
+// ============================================
+
+/**
+ * GET /api/object-types
+ * Get available drift object types
+ */
+app.get('/api/object-types', (req, res) => {
   res.json({
-    nautical: 'https://tileservice.charts.noaa.gov/tiles/50000_1/{z}/{x}/{y}.png',
-    enc: 'https://gis.charttools.noaa.gov/arcgis/rest/services/MCS/NOAAChartDisplay/MapServer/tile/{z}/{y}/{x}',
-    coverage: 'All US Waters'
+    types: [
+      'person-in-water',
+      'person-with-pfd',
+      'person-in-drysuit',
+      'life-raft-4',
+      'life-raft-6',
+      'life-raft-10-plus',
+      'small-vessel',
+      'medium-vessel',
+      'sailboat',
+      'kayak',
+      'canoe',
+      'surfboard',
+      'paddleboard',
+      'debris-small',
+      'debris-large'
+    ]
   });
 });
 
 // ============================================
-// SIMULATIONS
+// BATHYMETRY ENDPOINT (placeholder)
 // ============================================
+app.post('/api/bathymetry/contours', (req, res) => {
+  res.json({ 
+    contours: [],
+    message: 'Bathymetry data not yet implemented'
+  });
+});
 
-const simulations = new Map();
-
-app.post('/api/simulations', (req, res) => {
-  const id = `sim_${Date.now()}`;
-  simulations.set(id, { id, status: 'running', progress: 0, config: req.body });
+// ============================================
+// SHORELINE DATA ENDPOINT
+// ============================================
+app.get('/api/shoreline', (req, res) => {
+  const { lat, lng, radius } = req.query;
   
-  let p = 0;
-  const i = setInterval(() => {
-    p += 10;
-    const s = simulations.get(id);
-    if (s) {
-      s.progress = Math.min(p, 100);
-      if (p >= 100) { s.status = 'completed'; clearInterval(i); }
-    }
-  }, 500);
-  
-  res.json({ simulationId: id, status: 'started' });
-});
-
-app.get('/api/simulations/:id/status', (req, res) => {
-  const s = simulations.get(req.params.id);
-  if (!s) return res.status(404).json({ error: 'Not found' });
-  res.json({ id: s.id, status: s.status, progress: s.progress });
-});
-
-app.get('/api/simulations/:id/results', (req, res) => {
-  const s = simulations.get(req.params.id);
-  if (!s) return res.status(404).json({ error: 'Not found' });
-  res.json({ id: s.id, status: s.status, results: { probabilityZones: [] } });
-});
-
-// ============================================
-// OBJECT TYPES
-// ============================================
-
-app.get('/api/object-types', (req, res) => {
   res.json({
-    types: ['person-in-water','person-with-pfd','life-raft-4','life-raft-6','small-vessel','kayak','paddleboard','debris']
+    polygons: [
+      {
+        name: 'Texas City',
+        coordinates: [
+          { lat: 29.4200, lng: -94.9500 },
+          { lat: 29.4200, lng: -94.8800 },
+          { lat: 29.3800, lng: -94.8800 },
+          { lat: 29.3800, lng: -94.9500 }
+        ]
+      },
+      {
+        name: 'Galveston Island',
+        coordinates: [
+          { lat: 29.3100, lng: -94.8600 },
+          { lat: 29.2700, lng: -94.8200 },
+          { lat: 29.2000, lng: -94.7800 },
+          { lat: 29.1800, lng: -94.8800 },
+          { lat: 29.2200, lng: -94.9500 },
+          { lat: 29.2700, lng: -94.9200 }
+        ]
+      }
+    ],
+    source: 'fallback',
+    fetchedAt: new Date().toISOString()
   });
 });
 
 // ============================================
 // ERROR HANDLING
 // ============================================
+app.use((err, req, res, next) => {
+  console.error('[Server] Unhandled error:', err);
+  res.status(500).json({ 
+    error: 'Internal server error',
+    message: err.message 
+  });
+});
 
 app.use((req, res) => {
-  res.status(404).json({ error: 'Not found', path: req.path });
-});
-
-app.use((err, req, res, next) => {
-  console.error('Error:', err.message);
-  res.status(500).json({ error: err.message });
+  res.status(404).json({ 
+    error: 'Not found',
+    path: req.path 
+  });
 });
 
 // ============================================
-// START
+// START SERVER
 // ============================================
-
 app.listen(PORT, '0.0.0.0', () => {
-  console.log(`\n=== RescueGPS Backend v2.2.1 ===`);
+  console.log('');
+  console.log('=== RescueGPS Backend v2.3.0 ===');
   console.log(`Port: ${PORT}`);
-  console.log(`Coverage: USA Nationwide`);
-  console.log(`Status: Ready\n`);
+  console.log(`NOAA Service: ${noaaService ? 'LOADED' : 'NOT AVAILABLE'}`);
+  console.log(`Simulation Service: ${simulationController ? 'LOADED' : 'NOT AVAILABLE'}`);
+  console.log('Coverage: USA Nationwide');
+  console.log('Status: Ready');
+  console.log('================================');
+  console.log('');
 });
-
-module.exports = app;
